@@ -1,0 +1,23 @@
+{
+  "name": "tactical-tutor-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "start": "node --env-file=.env --enable-source-maps --experimental-modules --no-warnings $(npm bin)/tsx src/index.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "latest",
+    "dotenv": "latest",
+    "fastify": "latest",
+    "chess.js": "latest",
+    "nanoid": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "react-native-svg-transformer": "^1.5.1",
+    "tsx": "latest",
+    "typescript": "latest"
+  }
+}
