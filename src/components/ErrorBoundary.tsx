@@ -35,8 +35,14 @@ export class ErrorBoundary extends React.Component<Props, State> {
   };
 
   render() {
+    console.log('[ErrorBoundary] ===== render() called =====');
+    console.log('[ErrorBoundary] hasError:', this.state.hasError);
+    console.log('[ErrorBoundary] error:', this.state.error);
+    
     if (this.state.hasError) {
-      console.log('[ErrorBoundary] Rendering error UI');
+      console.log('[ErrorBoundary] ===== Rendering error UI =====');
+      console.log('[ErrorBoundary] Error message:', this.state.error?.message);
+      console.log('[ErrorBoundary] Error stack:', this.state.error?.stack);
       return (
         <View style={styles.container}>
           <View style={styles.content}>
@@ -65,7 +71,9 @@ export class ErrorBoundary extends React.Component<Props, State> {
       );
     }
 
-    console.log('[ErrorBoundary] Rendering children');
+    console.log('[ErrorBoundary] ===== Rendering children (no error) =====');
+    console.log('[ErrorBoundary] Children count:', React.Children.count(this.props.children));
+    console.log('[ErrorBoundary] Children type:', typeof this.props.children);
     return this.props.children;
   }
 }

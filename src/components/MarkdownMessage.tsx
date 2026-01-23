@@ -1,7 +1,8 @@
 import React, { memo } from 'react';
-import { Linking, useColorScheme, View } from 'react-native';
+import { Linking, useColorScheme, View, StyleSheet } from 'react-native';
 import Markdown from 'react-native-markdown-display';
 import { colors, radii } from '../theme';
+import { Board } from './chess/Board';
 
 type Props = {
   text: string;
@@ -15,9 +16,30 @@ function getTextFromChildren(children: any): string {
   return '';
 }
 
+/**
+ * Parse [POSITION:fen] and [BOARD:fen] tags and replace them with board components
+ */
+function parsePositionTags(text: string): { content: string; boards: Map<string, string> } {
+  const boards = new Map<string, string>();
+  let counter = 0;
+  
+  // Replace both [POSITION:fen] and [BOARD:fen] with placeholders
+  let content = text.replace(/\[(?:POSITION|BOARD):([^\]]+)\]/g, (match, fen) => {
+    const boardId = `__BOARD_${counter}__`;
+    boards.set(boardId, fen.trim());
+    counter++;
+    return `\n\n${boardId}\n\n`;
+  });
+  
+  return { content, boards };
+}
+
 const MarkdownMessage = ({ text }: Props) => {
   const scheme = useColorScheme();
   const isDark = scheme === 'dark';
+  
+  // Parse position tags before rendering
+  const { content, boards } = parsePositionTags(text);
 
   const mdStyles = {
     body: {
@@ -118,6 +140,32 @@ const MarkdownMessage = ({ text }: Props) => {
         </View>
       );
     },
+    // Custom rule to render chess board placeholders
+    paragraph: (node: any, children: any, parent: any, styles: any) => {
+      // Check if this paragraph contains a board placeholder
+      const textContent = getTextFromChildren(children);
+      const boardMatch = textContent.match(/^__BOARD_(\d+)__$/);
+      
+      if (boardMatch) {
+        const boardId = textContent.trim();
+        const fen = boards.get(boardId);
+        
+        if (fen) {
+          return (
+            <View key={boardId} style={boardStyles.container}>
+              <Board fen={fen} size={280} />
+            </View>
+          );
+        }
+      }
+      
+      // Default paragraph rendering
+      return (
+        <View key={node.key} style={styles.paragraph}>
+          {children}
+        </View>
+      );
+    },
   } as const;
 
   return (
@@ -130,10 +178,18 @@ const MarkdownMessage = ({ text }: Props) => {
       }}
       rules={rules as any}
     >
-      {text || '…'}
+      {content || '…'}
     </Markdown>
   );
 };
+
+const boardStyles = StyleSheet.create({
+  container: {
+    alignItems: 'center',
+    marginVertical: 12,
+    paddingVertical: 8,
+  },
+});
 
 export default memo(MarkdownMessage);
 

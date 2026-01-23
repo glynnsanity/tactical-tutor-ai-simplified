@@ -7,7 +7,7 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "reset-onboarding": "xcrun simctl spawn booted 'defaults delete com.glynnjordan.tacticaltutor' 2>/dev/null || echo 'Or manually: Press j in Metro, then clear AsyncStorage'; echo 'Reloading simulator data...'",
+    "reset-onboarding": "npm run clear-storage",
     "clear-storage": "node scripts/clearStorage.js"
   },
   "dependencies": {

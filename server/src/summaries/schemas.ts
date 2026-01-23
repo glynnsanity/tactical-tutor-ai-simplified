@@ -3,6 +3,7 @@ import { z } from 'zod';
 export const KeyPosition = z.object({
   moveNo: z.number(),
   side: z.enum(["W", "B"]),
+  move: z.string().optional(), // Added: the actual move in SAN notation
   fen: z.string(),
   tag: z.array(z.string()).default([]),
   evalBefore: z.number().nullable().default(null),
@@ -29,7 +30,12 @@ export const CompactGameSummary = z.object({
   mistakes: z.number().default(0),
   blunders: z.number().default(0),
   inaccuracies: z.number().default(0),
-  keyPositions: z.array(KeyPosition).max(4).default([]),
+  keyPositions: z.array(KeyPosition).default([]), // No limit - analyze all moves
+  // Enhanced game references for better coaching
+  chesscomUrl: z.string().nullable().default(null), // Link to view full game
+  whitePlayer: z.string().nullable().default(null), // White player username
+  blackPlayer: z.string().nullable().default(null), // Black player username
+  opponent: z.string().nullable().default(null), // Opponent's username (derived from userColor)
 });
 
 export type CompactGameSummaryT = z.infer<typeof CompactGameSummary>;

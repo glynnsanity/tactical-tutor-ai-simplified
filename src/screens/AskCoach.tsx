@@ -1,13 +1,50 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { View, Text, ScrollView, TextInput, KeyboardAvoidingView, Platform, Linking, Keyboard } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { ScreenHeader } from '../components/ScreenHeader';
-import MarkdownMessage from '../components/MarkdownMessage';
+
+// Try importing components one by one to isolate the issue
+console.log('[AskCoach] Step 1: Basic imports done');
+
 import { colors, radii } from '../theme';
-import { Crown, Loader } from 'lucide-react-native';
+console.log('[AskCoach] Step 2: Theme imported');
+
 import { Button } from '../components/ui/Button';
-import { ask, poll } from '../lib/api';
+console.log('[AskCoach] Step 3: Button imported');
+
 import AsyncStorage from '@react-native-async-storage/async-storage';
+console.log('[AskCoach] Step 4: AsyncStorage imported');
+
+// Import with try-catch to isolate issues
+let ScreenHeader: any = null;
+try {
+  const headerModule = require('../components/ScreenHeader');
+  ScreenHeader = headerModule.ScreenHeader;
+  console.log('[AskCoach] Step 5: ScreenHeader imported');
+} catch (e) {
+  console.error('[AskCoach] Error importing ScreenHeader:', e);
+}
+
+let MarkdownMessage: any = null;
+try {
+  MarkdownMessage = require('../components/MarkdownMessage').default;
+  console.log('[AskCoach] Step 6: MarkdownMessage imported');
+} catch (e) {
+  console.error('[AskCoach] Error importing MarkdownMessage:', e);
+}
+
+let Crown: any = () => null;
+let Loader: any = () => null;
+try {
+  const lucide = require('lucide-react-native');
+  Crown = lucide.Crown;
+  Loader = lucide.Loader;
+  console.log('[AskCoach] Step 7: Lucide icons imported');
+} catch (e) {
+  console.error('[AskCoach] Error importing lucide icons:', e);
+}
+
+import { ask, poll } from '../lib/api';
+console.log('[AskCoach] Step 8: API imported');
 
 type MessageRole = 'user' | 'assistant';
 
@@ -27,10 +64,26 @@ const MAX_MESSAGE_LENGTH = 2000;
 const POLL_TIMEOUT_MS = 30000; // 30 second timeout for poll requests
 const SCROLL_SAVE_DELAY = 300; // Debounce scroll position saves
 
-export default function AskCoach() {
+console.log('[AskCoach] Module evaluation complete. About to export component');
+
+function AskCoach(props: any) {
+  console.log('[AskCoach] ===== FUNCTION CALLED - COMPONENT STARTING =====');
+  console.log('[AskCoach] Props received:', props);
+  console.log('[AskCoach] Props keys:', props ? Object.keys(props) : 'null');
+  
+  console.log('[AskCoach] About to call useState for messages');
   const [messages, setMessages] = useState<ChatMessage[]>([WELCOME_MESSAGE]);
+  console.log('[AskCoach] useState messages called successfully, messages length:', messages.length);
+  
+  console.log('[AskCoach] About to call useState for input');
   const [input, setInput] = useState('');
+  console.log('[AskCoach] useState input called successfully');
+  
+  console.log('[AskCoach] About to call useState for isTyping');
   const [isTyping, setIsTyping] = useState(false);
+  console.log('[AskCoach] useState isTyping called successfully');
+  
+  console.log('[AskCoach] About to create refs');
   const scrollRef = useRef<ScrollView | null>(null);
   const pollRef = useRef<{ cancel: () => void } | null>(null);
   const activeTimeoutsRef = useRef<Set<NodeJS.Timeout>>(new Set());
@@ -284,7 +337,13 @@ export default function AskCoach() {
               {m.text}
             </Text>
           ) : (
-            <MarkdownMessage text={m.text} />
+            MarkdownMessage ? (
+              <MarkdownMessage text={m.text} />
+            ) : (
+              <Text style={{ color: colors.text, fontSize: 15, lineHeight: 20 }}>
+                {m.text}
+              </Text>
+            )
           )}
         </View>
       </View>
@@ -292,9 +351,22 @@ export default function AskCoach() {
   };
 
 
+  console.log('[AskCoach] About to return JSX');
+  console.log('[AskCoach] About to render SafeAreaView');
+  
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: colors.background }}>
-      <ScreenHeader title="Ask Your Coach" subtitle="Personalized guidance from your games" LeftIcon={Crown} />
+      {(() => {
+        console.log('[AskCoach] SafeAreaView rendered');
+        return null;
+      })()}
+      {ScreenHeader ? (
+        <ScreenHeader title="Ask Your Coach" subtitle="Personalized guidance from your games" LeftIcon={Crown} />
+      ) : (
+        <View style={{ padding: 24, backgroundColor: colors.headerBg }}>
+          <Text style={{ color: 'white' }}>Header not loaded</Text>
+        </View>
+      )}
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={Platform.OS === 'ios' ? 8 : 0}>
         <View style={{ flex: 1 }}>
           <ScrollView
@@ -380,3 +452,6 @@ export default function AskCoach() {
     </SafeAreaView>
   );
 }
+
+console.log('[AskCoach] Component function defined. Exporting as default');
+export default AskCoach;

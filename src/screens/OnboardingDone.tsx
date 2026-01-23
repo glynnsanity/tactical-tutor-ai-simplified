@@ -4,31 +4,41 @@ import {
   Text,
   StyleSheet,
   SafeAreaView,
-  AppState,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useNavigation } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { colors, spacing } from '../theme';
 
+type RootStackParamList = {
+  OnboardingIntro: undefined;
+  ChessComUsername: undefined;
+  OnboardingDone: undefined;
+  Chat: undefined;
+};
+
+type NavigationProp = NativeStackNavigationProp<RootStackParamList>;
+
 export default function OnboardingDone() {
+  const navigation = useNavigation<NavigationProp>();
+
   useEffect(() => {
     const completeOnboarding = async () => {
       try {
         await AsyncStorage.setItem('onboardingComplete', '1');
-        
         console.log('[OnboardingDone] Onboarding marked complete');
         
-        // Trigger an app state change to notify listeners (like in App.tsx)
-        // This will cause App.tsx's AppState listener to fire
-        AppState.currentState;
+        // Navigate directly to Chat after a short delay
+        setTimeout(() => {
+          navigation.navigate('Chat');
+        }, 1500);
       } catch (error) {
         console.error('Failed to complete onboarding:', error);
       }
     };
 
-    // Complete onboarding after a short delay to show the screen
-    const timer = setTimeout(completeOnboarding, 1500);
-    return () => clearTimeout(timer);
-  }, []);
+    completeOnboarding();
+  }, [navigation]);
 
   return (
     <SafeAreaView style={styles.container}>

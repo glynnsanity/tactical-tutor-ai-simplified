@@ -30,7 +30,7 @@ export async function streamAnswer(opts: StreamOpts): Promise<void> {
     ],
     stream: true,
     max_tokens: opts.maxTokens ?? env.MAX_TOKENS ?? 1024,
-    temperature: opts.temperature ?? 0.7,
+    temperature: opts.temperature ?? 0.3,  // Lowered for more deterministic, grounded responses
   };
 
   const headers: Record<string, string> = {

@@ -4,15 +4,17 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
     "start": "node --env-file=.env --enable-source-maps --experimental-modules --no-warnings $(npm bin)/tsx src/index.ts"
   },
   "dependencies": {
     "@fastify/cors": "latest",
+    "chess.js": "latest",
     "dotenv": "latest",
     "fastify": "latest",
-    "chess.js": "latest",
     "nanoid": "latest",
+    "node-uci": "^1.3.4",
+    "stockfish.js": "^10.0.2",
     "zod": "latest"
   },
   "devDependencies": {

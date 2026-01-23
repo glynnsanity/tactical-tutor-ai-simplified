@@ -1,6 +1,8 @@
 import { Chess } from 'chess.js';
 import crypto from 'crypto';
 import { CompactGameSummary, type CompactGameSummaryT } from '../summaries/schemas';
+import { fetchOpeningName } from './chesscom';
+import { analyzePosition } from '../services/positionAnalyzer';
 
 type Headers = Record<string, string>;
 
@@ -14,19 +16,15 @@ export function parsePgnHeaders(pgn: string): Headers {
   return headers;
 }
 
-function mapResult(res: string | undefined): CompactGameSummaryT['result'] {
-  switch (res) {
-    case '1-0':
-      return 'checkmate';
-    case '0-1':
-      return 'checkmate';
-    case '1/2-1/2':
-      return 'draw';
-    case 'abandoned':
-      return 'abort';
-    default:
-      return 'other';
-  }
+function mapResultForUser(
+  res: string | undefined,
+  userColor: 'white' | 'black'
+): CompactGameSummaryT['result'] {
+  if (!res) return 'other';
+  if (res === '1/2-1/2') return 'draw';
+  if (res === '1-0') return userColor === 'white' ? 'win' : 'loss';
+  if (res === '0-1') return userColor === 'black' ? 'win' : 'loss';
+  return 'other';
 }
 
 function toIso(dateStr: string | undefined): string {
@@ -64,44 +62,122 @@ function parseTimeControl(tc: string | undefined): { type: 'bullet' | 'blitz' | 
   return { type, base, increment };
 }
 
-function pickKeyPositions(pgn: string): { moveNo: number; side: 'W' | 'B'; fen: string; tag: string[] }[] {
-  const positions: { moveNo: number; side: 'W' | 'B'; fen: string; tag: string[] }[] = [];
+/**
+ * Analyze ALL moves in a game with parallel batching
+ * Returns evaluations for every position in the game
+ */
+async function analyzeAllMoves(
+  pgn: string,
+  options: { batchSize?: number } = {}
+): Promise<{ 
+  moveNo: number; 
+  side: 'W' | 'B'; 
+  move: string;
+  fen: string; 
+  tag: string[]; 
+  evalBefore: number | null;
+  evalAfter: number | null;
+  bestMove: string | null;
+}[]> {
+  const { batchSize = 20 } = options;
+  
   const chess = new Chess();
   chess.loadPgn(pgn, { sloppy: true });
   const history = chess.history({ verbose: true });
-  const seen = new Set<string>();
+
+  // Collect all positions to analyze
+  const positionsToAnalyze: {
+    moveNo: number;
+    side: 'W' | 'B';
+    move: string;
+    fenBefore: string;
+    fenAfter: string;
+    tag: string[];
+  }[] = [];
 
   chess.reset();
-  let moveIndex = 0;
   for (const mv of history) {
+    const fenBefore = chess.fen();
     chess.move(mv);
-    moveIndex++;
     const fullMove = chess.turn() === 'w' ? chess.moveNumber() - 1 : chess.moveNumber();
     const side: 'W' | 'B' = mv.color === 'w' ? 'W' : 'B';
-    const fen = chess.fen();
+    const fenAfter = chess.fen();
 
-    // (a) first capture that changes material balance
-    if (mv.flags?.includes('c') && !seen.has('material')) {
-      positions.push({ moveNo: fullMove, side, fen, tag: ['material_change'] });
-      seen.add('material');
-    }
-    // (b) first check
-    if (mv.flags?.includes('+')) {
-      if (!seen.has('check')) {
-        positions.push({ moveNo: fullMove, side, fen, tag: ['check'] });
-        seen.add('check');
-      }
-    }
-    // (c) near mate: if game ended by mate, collect last 1-2 plies
-    if (mv.san.includes('#')) {
-      positions.push({ moveNo: fullMove, side, fen, tag: ['final_attack'] });
-    }
-    if (positions.length >= 3) break;
+    // Tag special moves
+    const tags: string[] = [];
+    if (mv.flags?.includes('c')) tags.push('capture');
+    if (mv.flags?.includes('+')) tags.push('check');
+    if (mv.san.includes('#')) tags.push('checkmate');
+    if (mv.flags?.includes('k') || mv.flags?.includes('q')) tags.push('castle');
+
+    positionsToAnalyze.push({
+      moveNo: fullMove,
+      side,
+      move: mv.san,
+      fenBefore,
+      fenAfter,
+      tag: tags
+    });
   }
-  return positions.slice(0, 3);
+
+  // Analyze in parallel batches
+  const analyzed: {
+    moveNo: number;
+    side: 'W' | 'B';
+    move: string;
+    fen: string;
+    tag: string[];
+    evalBefore: number | null;
+    evalAfter: number | null;
+    bestMove: string | null;
+  }[] = [];
+
+  for (let i = 0; i < positionsToAnalyze.length; i += batchSize) {
+    const batch = positionsToAnalyze.slice(i, i + batchSize);
+    
+    // Analyze each position in the batch in parallel
+    const batchResults = await Promise.all(
+      batch.map(async (pos) => {
+        try {
+          // Analyze both before and after positions in parallel
+          const [evalBefore, evalAfter] = await Promise.all([
+            analyzePosition(pos.fenBefore),
+            analyzePosition(pos.fenAfter)
+          ]);
+          
+          return {
+            moveNo: pos.moveNo,
+            side: pos.side,
+            move: pos.move,
+            fen: pos.fenAfter,
+            tag: pos.tag,
+            evalBefore: evalBefore.eval / 100, // Convert centipawns to pawns
+            evalAfter: evalAfter.eval / 100,
+            bestMove: evalBefore.bestMove || null
+          };
+        } catch (error) {
+          console.error(`Failed to analyze position at move ${pos.moveNo}:`, error);
+          return {
+            moveNo: pos.moveNo,
+            side: pos.side,
+            move: pos.move,
+            fen: pos.fenAfter,
+            tag: pos.tag,
+            evalBefore: null,
+            evalAfter: null,
+            bestMove: null
+          };
+        }
+      })
+    );
+    
+    analyzed.push(...batchResults);
+  }
+
+  return analyzed;
 }
 
-export function pgnToSummary(pgn: string, username: string): CompactGameSummaryT | null {
+export async function pgnToSummary(pgn: string, username: string): Promise<CompactGameSummaryT | null> {
   const headers = parsePgnHeaders(pgn);
   if (!isStandard(headers)) return null;
   const rated = /rated/i.test(headers.Event || '') || /rated/i.test(headers.Termination || '');
@@ -114,11 +190,23 @@ export function pgnToSummary(pgn: string, username: string): CompactGameSummaryT
   const gameId = hashId(headers);
   const date = toIso(headers.Date);
   const tc = parseTimeControl(headers.TimeControl);
-  const opening = { eco: headers.ECO ?? null, name: headers.Opening ?? null };
+  
+  // Fetch opening name from ECO code if not provided
+  const eco = headers.ECO ?? null;
+  const openingName = headers.Opening || (await fetchOpeningName(eco));
+  const opening = { eco, name: openingName };
+  
   const userColor = white === user ? 'white' : 'black';
-  const result = mapResult(headers.Result);
+  const result = mapResultForUser(headers.Result, userColor);
 
-  const keyPositions = pickKeyPositions(pgn).map((kp) => ({ ...kp, evalBefore: null, evalAfter: null, bestMove: null }));
+  // Extract player names and Chess.com URL for better game references
+  const whitePlayer = headers.White || null;
+  const blackPlayer = headers.Black || null;
+  const opponent = userColor === 'white' ? blackPlayer : whitePlayer;
+  const chesscomUrl = headers.Link || null;
+
+  // Analyze all moves in the game (not just key positions)
+  const keyPositions = await analyzeAllMoves(pgn, { batchSize: 20 });
 
   const summary: CompactGameSummaryT = CompactGameSummary.parse({
     gameId,
@@ -136,6 +224,11 @@ export function pgnToSummary(pgn: string, username: string): CompactGameSummaryT
     blunders: 0,
     inaccuracies: 0,
     keyPositions,
+    // Enhanced game references
+    chesscomUrl,
+    whitePlayer,
+    blackPlayer,
+    opponent,
   });
   return summary;
 }
