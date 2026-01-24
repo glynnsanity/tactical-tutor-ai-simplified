@@ -4,14 +4,66 @@ import type { z } from 'zod';
 type KeyPositionT = z.infer<typeof KeyPosition>;
 import { matchOpeningFromQuestion, type OpeningMatch } from './openingMatcher';
 import { isEcoInFamily } from '../data/ecoDatabase';
+import type { PlayerProfileT } from '../profile/schema';
+import type { IntentAnalysis } from '../services/intentAnalyzer';
+
+// Analysis depth for complex queries
+export type AnalysisDepthChoice = 'quick' | 'standard' | 'deep';
+
+/**
+ * Detect if a question is asking for complex analysis that might need scope prompting
+ */
+export function detectComplexAnalysisRequest(q: string): {
+  isComplex: boolean;
+  opening?: string;
+  timeControl?: string;
+} {
+  const lowerQ = q.toLowerCase();
+
+  // Keywords that suggest wanting detailed analysis
+  const complexKeywords = [
+    'analyze all',
+    'deep dive',
+    'detailed analysis',
+    'full analysis',
+    'comprehensive',
+    'in-depth',
+    'review all',
+    'go through all',
+    'every game',
+    'all my games',
+    'thorough analysis',
+    'complete analysis',
+  ];
+
+  const hasComplexKeyword = complexKeywords.some(kw => lowerQ.includes(kw));
+
+  if (!hasComplexKeyword) {
+    return { isComplex: false };
+  }
+
+  // Try to extract context
+  const openingMatch = matchOpeningFromQuestion(q);
+  const opening = openingMatch.matched ? (openingMatch.opening?.name || openingMatch.family) : undefined;
+
+  let timeControl: string | undefined;
+  if (lowerQ.includes('bullet')) timeControl = 'bullet';
+  else if (lowerQ.includes('blitz')) timeControl = 'blitz';
+  else if (lowerQ.includes('rapid')) timeControl = 'rapid';
+
+  return { isComplex: true, opening, timeControl };
+}
 
 // Question type classification
 export type QuestionType =
   | { kind: 'opening'; opening: string; openingMatch: OpeningMatch }
+  | { kind: 'endgame' }
   | { kind: 'blunders' }
   | { kind: 'time_control'; timeControl: 'bullet' | 'blitz' | 'rapid' | 'daily' }
   | { kind: 'result'; result: 'win' | 'loss' | 'draw' }
   | { kind: 'meta'; metaType: 'count' | 'overview' | 'openings' | 'stats' }
+  | { kind: 'historical'; opening?: string; timeControl?: string }
+  | { kind: 'analysis_request'; depth: AnalysisDepthChoice; opening?: string; timeControl?: string }
   | { kind: 'general' };
 
 // Selected game with relevance info
@@ -20,7 +72,7 @@ export interface SelectedGame {
   opponent: string;
   date: string;
   result: 'win' | 'loss' | 'draw' | string;
-  opening: { eco: string | null; name: string | null };
+  opening: { eco: string | null | undefined; name: string | null | undefined };
   userColor: 'white' | 'black';
   userRating: number | null;
   oppRating: number | null;
@@ -77,6 +129,7 @@ export interface SelectedContent {
   statistics: Statistics;
   coachingContext: string;
   dataAvailability: DataAvailability;
+  profile: PlayerProfileT | null;
 }
 
 /**
@@ -86,9 +139,15 @@ export function selectContent(
   question: string,
   summaries: CompactGameSummaryT[],
   maxGames: number = 3,
-  maxPositions: number = 2
+  maxPositions: number = 2,
+  profile: PlayerProfileT | null = null,
+  intent?: IntentAnalysis
 ): SelectedContent {
-  const questionType = classifyQuestion(question);
+  // Use intent-based classification if available, otherwise fall back to keyword-based
+  const questionType = intent
+    ? intentToQuestionType(intent, question)
+    : classifyQuestion(question);
+
   const selectionResult = selectGames(summaries, questionType, maxGames);
 
   // Extract games array from result (empty if no_matches)
@@ -117,7 +176,7 @@ export function selectContent(
 
   // Build context - will be different if no matches
   const coachingContext = selectionResult.status === 'found'
-    ? buildCoachingContext(question, games, positions, statistics, questionType)
+    ? buildCoachingContext(question, games, positions, statistics, questionType, profile)
     : buildNoMatchContext(question, selectionResult, statistics, questionType, dataAvailability);
 
   return {
@@ -128,6 +187,7 @@ export function selectContent(
     statistics,
     coachingContext,
     dataAvailability,
+    profile,
   };
 }
 
@@ -219,13 +279,117 @@ function detectMetaQuestion(q: string): 'count' | 'overview' | 'openings' | 'sta
 }
 
 /**
+ * Detect historical questions that need all-time data
+ */
+function detectHistoricalQuestion(q: string): { isHistorical: boolean; opening?: string; timeControl?: string } {
+  // Try to extract opening name first
+  const openingMatch = matchOpeningFromQuestion(q);
+  const opening = openingMatch.matched ? (openingMatch.opening?.name || openingMatch.family || undefined) : undefined;
+
+  // Try to extract time control
+  let timeControl: string | undefined;
+  if (q.includes('bullet')) timeControl = 'bullet';
+  else if (q.includes('blitz')) timeControl = 'blitz';
+  else if (q.includes('rapid')) timeControl = 'rapid';
+  else if (q.includes('daily') || q.includes('correspondence')) timeControl = 'daily';
+
+  // Historical indicators
+  const historicalKeywords = [
+    'how many times',
+    'over time',
+    'over the years',
+    'history with',
+    'my history',
+    'all time',
+    'all-time',
+    'lifetime',
+    'career',
+    'ever played',
+    'total times',
+    'historically',
+    'trend',
+    'progression',
+    'performed in',
+    'performance in',
+    'show me my',
+    'how have i done',
+    'how did i do',
+  ];
+
+  const hasHistoricalKeyword = historicalKeywords.some(kw => q.includes(kw));
+
+  // Also consider it historical if asking about specific opening/TC with "how many" or "how well"
+  const hasHowQuestion = q.includes('how many') || q.includes('how well') || q.includes('how have');
+  const hasSpecificContext = opening || timeControl;
+
+  if (hasHistoricalKeyword || (hasHowQuestion && hasSpecificContext)) {
+    return { isHistorical: true, opening, timeControl };
+  }
+
+  return { isHistorical: false };
+}
+
+/**
  * Classify the question type based on keywords
  * Uses fuzzy opening matching for accurate detection
  */
+/**
+ * Detect analysis depth choice (follow-up to scope prompt)
+ */
+function detectAnalysisDepthChoice(q: string): { hasChoice: boolean; depth?: AnalysisDepthChoice; opening?: string; timeControl?: string } {
+  // Check for explicit depth keywords
+  const quickPatterns = ['quick', 'fast', 'sample', '⚡'];
+  const standardPatterns = ['standard', 'full', 'all games', '📊'];
+  const deepPatterns = ['deep', 'detailed', 'position', 'thorough', '🔬'];
+
+  let depth: AnalysisDepthChoice | undefined;
+
+  if (quickPatterns.some(p => q.includes(p))) {
+    depth = 'quick';
+  } else if (deepPatterns.some(p => q.includes(p))) {
+    depth = 'deep';
+  } else if (standardPatterns.some(p => q.includes(p))) {
+    depth = 'standard';
+  }
+
+  if (!depth) {
+    return { hasChoice: false };
+  }
+
+  // Try to extract context (opening or time control)
+  const openingMatch = matchOpeningFromQuestion(q);
+  const opening = openingMatch.matched ? (openingMatch.opening?.name || openingMatch.family) : undefined;
+
+  let timeControl: string | undefined;
+  if (q.includes('bullet')) timeControl = 'bullet';
+  else if (q.includes('blitz')) timeControl = 'blitz';
+  else if (q.includes('rapid')) timeControl = 'rapid';
+
+  return { hasChoice: true, depth, opening, timeControl };
+}
+
 function classifyQuestion(question: string): QuestionType {
   const q = question.toLowerCase();
 
-  // Check for META questions first (data-oriented questions that need facts, not coaching)
+  // Check for ANALYSIS DEPTH CHOICE first (follow-up to scope prompt)
+  const depthChoice = detectAnalysisDepthChoice(q);
+  if (depthChoice.hasChoice && depthChoice.depth) {
+    return {
+      kind: 'analysis_request',
+      depth: depthChoice.depth,
+      opening: depthChoice.opening,
+      timeControl: depthChoice.timeControl,
+    };
+  }
+
+  // Check for HISTORICAL questions FIRST (all-time stats, trends over time)
+  // These take priority over meta questions when they reference specific openings or time controls
+  const historical = detectHistoricalQuestion(q);
+  if (historical.isHistorical) {
+    return { kind: 'historical', opening: historical.opening, timeControl: historical.timeControl };
+  }
+
+  // Check for META questions (data-oriented questions that want facts, not coaching)
   // These should return statistics directly, not coaching advice
   const metaType = detectMetaQuestion(q);
   if (metaType) {
@@ -237,6 +401,22 @@ function classifyQuestion(question: string): QuestionType {
   if (openingMatch.matched && openingMatch.confidence > 0.6) {
     const openingName = openingMatch.opening?.name || openingMatch.family || 'unknown';
     return { kind: 'opening', opening: openingName.toLowerCase(), openingMatch };
+  }
+
+  // Check for endgame mentions
+  if (
+    q.includes('endgame') ||
+    q.includes('end game') ||
+    q.includes('ending') ||
+    q.includes('rook ending') ||
+    q.includes('pawn ending') ||
+    q.includes('queen ending') ||
+    q.includes('bishop ending') ||
+    q.includes('knight ending') ||
+    (q.includes('late') && q.includes('game')) ||
+    (q.includes('convert') && (q.includes('advantage') || q.includes('winning')))
+  ) {
+    return { kind: 'endgame' };
   }
 
   // Check for blunder/mistake mentions
@@ -267,6 +447,90 @@ function classifyQuestion(question: string): QuestionType {
   }
 
   return { kind: 'general' };
+}
+
+/**
+ * Convert IntentAnalysis to QuestionType
+ * This allows the intelligent LLM-based intent to drive content selection
+ */
+export function intentToQuestionType(intent: IntentAnalysis, question: string): QuestionType {
+  // If intent has specific filters, use them
+  if (intent.filters.opening) {
+    const openingMatch = matchOpeningFromQuestion(question);
+    return {
+      kind: 'opening',
+      opening: intent.filters.opening.toLowerCase(),
+      openingMatch: openingMatch.matched ? openingMatch : {
+        matched: true,
+        confidence: 0.9,
+        opening: { name: intent.filters.opening, eco: null },
+        family: null,
+        matchedText: intent.filters.opening,
+      },
+    };
+  }
+
+  if (intent.filters.timeControl) {
+    const tc = intent.filters.timeControl.toLowerCase();
+    if (tc === 'bullet' || tc === 'blitz' || tc === 'rapid' || tc === 'daily') {
+      return { kind: 'time_control', timeControl: tc };
+    }
+  }
+
+  if (intent.filters.result) {
+    return { kind: 'result', result: intent.filters.result };
+  }
+
+  // Map scope to question type
+  switch (intent.scope) {
+    case 'historical':
+      return {
+        kind: 'historical',
+        opening: intent.filters.opening,
+        timeControl: intent.filters.timeControl,
+      };
+
+    case 'stats':
+      // Determine meta type based on context needed
+      if (intent.contextNeeded.includes('opening_stats')) {
+        return { kind: 'meta', metaType: 'openings' };
+      }
+      return { kind: 'meta', metaType: 'stats' };
+
+    case 'single_game':
+      // For single game questions, use 'general' but the intent guidance will help
+      return { kind: 'general' };
+
+    case 'pattern':
+    case 'advice':
+      // For pattern questions, check what context is needed
+      if (intent.contextNeeded.includes('blunder_positions')) {
+        return { kind: 'blunders' };
+      }
+      if (intent.contextNeeded.includes('endgame_data')) {
+        return { kind: 'endgame' };
+      }
+      if (intent.contextNeeded.includes('opening_stats')) {
+        // Try to extract opening from question
+        const openingMatch = matchOpeningFromQuestion(question);
+        if (openingMatch.matched) {
+          return {
+            kind: 'opening',
+            opening: (openingMatch.opening?.name || openingMatch.family || '').toLowerCase(),
+            openingMatch,
+          };
+        }
+      }
+      // Default to general for pattern questions - the prompt guidance will handle it
+      return { kind: 'general' };
+
+    case 'comparison':
+      // Comparison questions default to general
+      return { kind: 'general' };
+
+    default:
+      return { kind: 'general' };
+  }
 }
 
 /**
@@ -363,11 +627,48 @@ function selectGames(
       reason = requestedFilter;
       break;
     }
+    case 'endgame': {
+      requestedFilter = 'games with endgame positions';
+      // Find games that have positions at move 30+ (likely endgame)
+      filtered = summaries
+        .filter(g => {
+          const maxMove = Math.max(...g.keyPositions.map(p => p.moveNo), 0);
+          return maxMove >= 30; // Game reached at least move 30
+        })
+        .sort((a, b) => {
+          // Prioritize games with more late-game positions
+          const aLatePositions = a.keyPositions.filter(p => p.moveNo >= 30).length;
+          const bLatePositions = b.keyPositions.filter(p => p.moveNo >= 30).length;
+          return bLatePositions - aLatePositions;
+        });
+      reason = 'games with endgame positions';
+      break;
+    }
     case 'blunders': {
       requestedFilter = 'games with mistakes';
+      // Look for games with large eval swings (indicates mistakes) since tags may not exist
       filtered = summaries
-        .filter(g => (g.mistakes || 0) + (g.blunders || 0) > 0)
-        .sort((a, b) => ((b.blunders || 0) + (b.mistakes || 0)) - ((a.blunders || 0) + (a.mistakes || 0)));
+        .map(g => {
+          // Calculate max eval swing in the game
+          let maxSwing = 0;
+          for (const pos of g.keyPositions) {
+            if (pos.evalBefore !== null && pos.evalAfter !== null) {
+              const swing = Math.abs(pos.evalAfter - pos.evalBefore);
+              if (swing > maxSwing) maxSwing = swing;
+            }
+          }
+          return { game: g, maxSwing };
+        })
+        .filter(({ maxSwing }) => maxSwing > 150) // More than 1.5 pawns swing
+        .sort((a, b) => b.maxSwing - a.maxSwing)
+        .map(({ game }) => game);
+
+      // Fall back to mistakes/blunders count if no eval swings found
+      if (filtered.length === 0) {
+        filtered = summaries
+          .filter(g => (g.mistakes || 0) + (g.blunders || 0) > 0)
+          .sort((a, b) => ((b.blunders || 0) + (b.mistakes || 0)) - ((a.blunders || 0) + (a.mistakes || 0)));
+      }
       reason = requestedFilter;
       break;
     }
@@ -527,6 +828,21 @@ function scorePosition(
     score += 30;
   }
 
+  // Endgame: strongly prioritize late-game positions
+  if (questionType.kind === 'endgame') {
+    if (pos.moveNo >= 40) {
+      score += 100; // Strong boost for move 40+
+    } else if (pos.moveNo >= 30) {
+      score += 50; // Medium boost for move 30-39
+    } else if (pos.moveNo < 20) {
+      score -= 30; // Penalize early positions
+    }
+    // Extra boost for positions with big eval swings in endgame (conversion issues)
+    if (pos.moveNo >= 30 && swing > 1.5) {
+      score += 40;
+    }
+  }
+
   // Prefer positions from losses (more to learn)
   if (gameResult === 'loss') {
     score += 15;
@@ -581,13 +897,81 @@ export function selectPositionsFromSummaries(
   scoredPositions.sort((a, b) => b.score - a.score);
 
   return scoredPositions.slice(0, maxPositions).map(({ pos, game }) => {
-    const evalBefore = pos.evalBefore ?? 0;
-    const evalAfter = pos.evalAfter ?? 0;
-    const swing = evalAfter - evalBefore;
+    // Process evaluations with proper handling of mate scores and unit detection
+    const rawEvalBefore = pos.evalBefore ?? 0;
+    const rawEvalAfter = pos.evalAfter ?? 0;
 
+    // Detect mate scores: values with absolute value >= 50 that look like mate indicators
+    // Mate scores are typically stored as large values (100, 1000, etc.)
+    const isMateScoreBefore = Math.abs(rawEvalBefore) >= 50;
+    const isMateScoreAfter = Math.abs(rawEvalAfter) >= 50;
+
+    // Convert to normalized evaluation (pawns scale, capped at ±15)
+    // Values >= 50 are either centipawns or mate scores - convert appropriately
+    let evalBefore: number;
+    let evalAfter: number;
+    let beforeIsMate = false;
+    let afterIsMate = false;
+
+    if (isMateScoreBefore) {
+      // Large value - could be centipawns or mate score
+      // Mate scores are typically 100+ after cp->pawn conversion, or 1000+ raw
+      if (Math.abs(rawEvalBefore) >= 100) {
+        // This is a mate score - cap at ±15 and mark as mate
+        evalBefore = rawEvalBefore > 0 ? 15 : -15;
+        beforeIsMate = true;
+      } else {
+        // Likely centipawns (50-99), convert to pawns
+        evalBefore = rawEvalBefore / 100;
+      }
+    } else {
+      // Small value - already in pawns
+      evalBefore = rawEvalBefore;
+    }
+
+    if (isMateScoreAfter) {
+      if (Math.abs(rawEvalAfter) >= 100) {
+        evalAfter = rawEvalAfter > 0 ? 15 : -15;
+        afterIsMate = true;
+      } else {
+        evalAfter = rawEvalAfter / 100;
+      }
+    } else {
+      evalAfter = rawEvalAfter;
+    }
+
+    // Cap at +/- 15 for display
+    const cappedEvalBefore = Math.max(-15, Math.min(15, evalBefore));
+    const cappedEvalAfter = Math.max(-15, Math.min(15, evalAfter));
+    const swing = cappedEvalAfter - cappedEvalBefore;
+
+    // Build clear display reason - avoid confusing "Lost X pawns" terminology
     let displayReason = '';
-    if (Math.abs(swing) > 2) {
-      displayReason = `${swing < 0 ? 'Lost' : 'Gained'} ${Math.abs(swing).toFixed(1)} pawns`;
+    if (beforeIsMate || afterIsMate) {
+      // Mate-related position
+      if (afterIsMate && !beforeIsMate) {
+        displayReason = cappedEvalAfter > 0 ? 'Checkmate threat created' : 'Allowed checkmate';
+      } else if (beforeIsMate && !afterIsMate) {
+        displayReason = cappedEvalBefore > 0 ? 'Lost winning attack' : 'Escaped checkmate threat';
+      } else {
+        displayReason = 'Critical position';
+      }
+    } else if (Math.abs(swing) > 2) {
+      // Significant eval swing - use clearer terminology
+      const absSwing = Math.abs(swing).toFixed(1);
+      if (swing < 0) {
+        if (Math.abs(swing) >= 5) {
+          displayReason = `Major blunder (eval: ${cappedEvalBefore > 0 ? '+' : ''}${cappedEvalBefore.toFixed(1)} → ${cappedEvalAfter > 0 ? '+' : ''}${cappedEvalAfter.toFixed(1)})`;
+        } else {
+          displayReason = `Mistake (eval dropped ${absSwing} points)`;
+        }
+      } else {
+        if (Math.abs(swing) >= 5) {
+          displayReason = `Opponent blundered (eval: ${cappedEvalBefore > 0 ? '+' : ''}${cappedEvalBefore.toFixed(1)} → ${cappedEvalAfter > 0 ? '+' : ''}${cappedEvalAfter.toFixed(1)})`;
+        } else {
+          displayReason = `Good move (eval gained ${absSwing} points)`;
+        }
+      }
     } else if (pos.tag.includes('blunder')) {
       displayReason = 'Blunder';
     } else if (pos.tag.includes('mistake')) {
@@ -606,8 +990,8 @@ export function selectPositionsFromSummaries(
       side: pos.side,
       movePlayed: pos.move || null,
       bestMove: pos.bestMove || null,
-      evalBefore,
-      evalAfter,
+      evalBefore: cappedEvalBefore,
+      evalAfter: cappedEvalAfter,
       evalSwing: swing,
       displayReason,
     };
@@ -687,7 +1071,8 @@ function buildCoachingContext(
   games: SelectedGame[],
   positions: SelectedPosition[],
   statistics: Statistics,
-  questionType: QuestionType
+  questionType: QuestionType,
+  profile: PlayerProfileT | null = null
 ): string {
   const lines: string[] = [];
 
@@ -698,11 +1083,87 @@ function buildCoachingContext(
   if (statistics.relevantStat) {
     lines.push(`Relevant: ${statistics.relevantStat}`);
   }
+  if (profile?.overall.trend) {
+    lines.push(`Trend: ${profile.overall.trend}`);
+  }
   lines.push('');
 
-  // Selected games
+  // PROFILE-BASED PATTERNS (holistic view across all games)
+  if (profile) {
+    // Include relevant weaknesses based on question type
+    const relevantWeaknesses = getRelevantPatterns(profile.weaknesses, questionType);
+    if (relevantWeaknesses.length > 0) {
+      lines.push(`IDENTIFIED PATTERNS (across all ${profile.gamesAnalyzed} games):`);
+      for (const weakness of relevantWeaknesses.slice(0, 3)) {
+        const confidenceLabel = weakness.confidence === 'high' ? '🔴'
+          : weakness.confidence === 'medium' ? '🟡' : '⚪';
+        lines.push(`${confidenceLabel} ${weakness.title}: ${weakness.description}`);
+        lines.push(`   Evidence: ${weakness.stats} (${weakness.frequency}, ${weakness.confidence} confidence)`);
+        lines.push(`   Recommendation: ${weakness.recommendation}`);
+        if (weakness.exampleGameIds.length > 0) {
+          lines.push(`   Example games: ${weakness.exampleGameIds.join(', ')}`);
+        }
+      }
+      lines.push('');
+    }
+
+    // Include relevant strengths
+    const relevantStrengths = getRelevantPatterns(profile.strengths, questionType);
+    if (relevantStrengths.length > 0) {
+      lines.push(`STRENGTHS:`);
+      for (const strength of relevantStrengths.slice(0, 2)) {
+        lines.push(`✓ ${strength.title}: ${strength.description}`);
+        lines.push(`   Evidence: ${strength.stats}`);
+      }
+      lines.push('');
+    }
+
+    // Opening-specific profile data
+    if (questionType.kind === 'opening' && profile.openings.length > 0) {
+      const matchingOpening = profile.openings.find(o =>
+        o.name.toLowerCase().includes(questionType.opening) ||
+        (o.family && o.family.toLowerCase().includes(questionType.opening))
+      );
+      if (matchingOpening) {
+        lines.push(`OPENING PROFILE - ${matchingOpening.name}:`);
+        lines.push(`  Games: ${matchingOpening.gamesPlayed} (${matchingOpening.asWhite}W/${matchingOpening.asBlack}B)`);
+        lines.push(`  Record: ${matchingOpening.wins}W-${matchingOpening.losses}L-${matchingOpening.draws}D (${matchingOpening.winRate.toFixed(0)}%)`);
+        lines.push(`  Avg mistakes/game: ${matchingOpening.avgMistakesPerGame.toFixed(1)}`);
+        if (matchingOpening.typicalDeviationMove) {
+          lines.push(`  Typical deviation from book: move ${matchingOpening.typicalDeviationMove}`);
+        }
+        if (matchingOpening.isWeakness) {
+          lines.push(`  ⚠️ This is a WEAK opening for you (below average win rate)`);
+        } else if (matchingOpening.isStrength) {
+          lines.push(`  ✓ This is a STRONG opening for you (above average win rate)`);
+        }
+        lines.push('');
+      }
+    }
+
+    // Phase-specific profile data for endgame questions
+    if (questionType.kind === 'endgame' && profile.phases.length > 0) {
+      const endgamePhase = profile.phases.find(p => p.phase === 'endgame');
+      if (endgamePhase) {
+        lines.push(`ENDGAME PROFILE:`);
+        lines.push(`  Mistake rate: ${endgamePhase.mistakeRate.toFixed(1)}/game`);
+        lines.push(`  Blunder rate: ${endgamePhase.blunderRate.toFixed(1)}/game`);
+        if (endgamePhase.isWeakestPhase) {
+          lines.push(`  ⚠️ Endgame is your WEAKEST phase`);
+        } else if (endgamePhase.isStrongestPhase) {
+          lines.push(`  ✓ Endgame is your STRONGEST phase`);
+        }
+        if (endgamePhase.commonMistakeTypes.length > 0) {
+          lines.push(`  Common issues: ${endgamePhase.commonMistakeTypes.join(', ')}`);
+        }
+        lines.push('');
+      }
+    }
+  }
+
+  // Selected games (specific examples)
   if (games.length > 0) {
-    lines.push(`SELECTED GAMES (${games[0].relevanceReason}):`);
+    lines.push(`SPECIFIC GAMES TO REFERENCE (${games[0].relevanceReason}):`);
     for (const game of games) {
       const resultEmoji = game.result === 'win' ? '✓' : game.result === 'loss' ? '✗' : '=';
       lines.push(`${resultEmoji} vs ${game.opponent} (${game.date})`);
@@ -737,6 +1198,29 @@ function buildCoachingContext(
   }
 
   return lines.join('\n');
+}
+
+/**
+ * Get patterns relevant to the question type
+ */
+function getRelevantPatterns(
+  patterns: PlayerProfileT['weaknesses'],
+  questionType: QuestionType
+): PlayerProfileT['weaknesses'] {
+  if (patterns.length === 0) return [];
+
+  // Filter patterns by relevance to question
+  switch (questionType.kind) {
+    case 'opening':
+      return patterns.filter(p => p.category === 'opening');
+    case 'endgame':
+      return patterns.filter(p => p.category === 'endgame' || p.category === 'positional');
+    case 'blunders':
+      return patterns.filter(p => p.category === 'tactical');
+    default:
+      // For general questions, return top patterns by severity
+      return patterns.slice(0, 3);
+  }
 }
 
 /**

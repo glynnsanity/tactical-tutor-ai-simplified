@@ -101,24 +101,44 @@ export type StructuredCoachResponseT = z.infer<typeof StructuredCoachResponse>;
  * Convert structured response to natural language
  */
 export function structuredToNaturalLanguage(response: StructuredCoachResponseT): string {
-  const parts: string[] = [];
-
-  // Main advice
-  parts.push(response.advice.mainPoint);
-
-  // Explanation
-  if (response.advice.explanation) {
-    parts.push(response.advice.explanation);
+  // Handle case where no data is available - return a single clean message
+  if (!response.grounding.dataAvailable) {
+    const limitation = response.meta.dataLimitations || 'No specific data available for this question';
+    return `I don't have enough specific data to answer that question fully. ${limitation}. ` +
+           `Try asking about your openings, recent games, or specific opponents!`;
   }
 
-  // Action item
-  if (response.advice.actionItem) {
-    parts.push(`Try this: ${response.advice.actionItem}`);
+  const parts: string[] = [];
+
+  // Main advice - skip if it's just a "no data" message
+  const mainPoint = response.advice.mainPoint.trim();
+  if (mainPoint && !mainPoint.toLowerCase().includes("don't have relevant data")) {
+    parts.push(mainPoint);
+  }
+
+  // Explanation - skip if it's just a "no data" message or duplicate
+  const explanation = response.advice.explanation.trim();
+  if (explanation &&
+      !explanation.toLowerCase().includes("don't have relevant data") &&
+      explanation !== mainPoint) {
+    parts.push(explanation);
+  }
+
+  // Action item - skip if it's just a "no data" message
+  const actionItem = response.advice.actionItem?.trim();
+  if (actionItem && !actionItem.toLowerCase().includes("don't have relevant data")) {
+    parts.push(`Try this: ${actionItem}`);
   }
 
   // Data limitation disclaimer if low confidence
   if (response.meta.confidenceLevel === 'low' && response.meta.dataLimitations) {
     parts.push(`(Note: ${response.meta.dataLimitations})`);
+  }
+
+  // If we filtered everything out, return a helpful default
+  if (parts.length === 0) {
+    return "I couldn't find specific data for that question in your games. " +
+           "Try asking about your openings, common mistakes, or recent opponents!";
   }
 
   return parts.join(' ');

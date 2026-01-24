@@ -7,18 +7,128 @@ export type StreamOpts = {
   onDone?: () => void;
   maxTokens?: number;
   temperature?: number;
+  model?: 'haiku' | 'sonnet' | 'default';  // Model selection for cascading
 };
 
 export async function streamAnswer(opts: StreamOpts): Promise<void> {
   const { system, user, onToken, onDone } = opts;
 
-  if (!env.OPENAI_API_KEY) {
-    await mockStream(system, user, onToken, onDone);
+  // Prefer Anthropic if available, otherwise fall back to OpenAI
+  if (env.ANTHROPIC_API_KEY) {
+    await streamAnthropic(opts);
     return;
   }
 
-  // Provider-backed streaming (OpenAI-compatible)
-  // Note: Kept minimal; swap to official SDK later if desired.
+  if (env.OPENAI_API_KEY) {
+    await streamOpenAI(opts);
+    return;
+  }
+
+  // No API key - use mock
+  await mockStream(system, user, onToken, onDone);
+}
+
+/**
+ * Stream from Anthropic's Claude API
+ */
+async function streamAnthropic(opts: StreamOpts): Promise<void> {
+  const { system, user, onToken, onDone } = opts;
+
+  const url = 'https://api.anthropic.com/v1/messages';
+
+  // Build messages - if user is empty, put system content as user message
+  const messages = user.trim()
+    ? [{ role: 'user', content: user }]
+    : [{ role: 'user', content: 'Please respond based on the system instructions.' }];
+
+  // Model cascading: use Haiku for fast/cheap tasks, Sonnet for complex
+  let modelName: string;
+  switch (opts.model) {
+    case 'haiku':
+      modelName = 'claude-3-5-haiku-20241022';  // Fast, cheap - good for classification
+      break;
+    case 'sonnet':
+      modelName = 'claude-sonnet-4-20250514';   // Balanced - good for coaching
+      break;
+    default:
+      modelName = env.MODEL_NAME || 'claude-sonnet-4-20250514';
+  }
+
+  const body = {
+    model: modelName,
+    max_tokens: opts.maxTokens ?? env.MAX_TOKENS ?? 1024,
+    system: system,
+    messages: messages,
+    stream: true,
+  };
+
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    'x-api-key': env.ANTHROPIC_API_KEY!,
+    'anthropic-version': '2023-06-01',
+  };
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok || !res.body) {
+    const text = await safeText(res);
+    throw new Error(`LLM request failed: ${res.status} ${text}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let done = false;
+
+  try {
+    while (!done) {
+      const { value, done: readerDone } = await reader.read();
+      if (readerDone) break;
+      const chunk = decoder.decode(value, { stream: true });
+
+      // Parse server-sent events
+      for (const line of chunk.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data:')) continue;
+        const payload = trimmed.slice(5).trim();
+
+        if (payload === '[DONE]') {
+          done = true;
+          break;
+        }
+
+        try {
+          const json = JSON.parse(payload);
+
+          // Handle Anthropic's event types
+          if (json.type === 'content_block_delta') {
+            const delta = json.delta?.text ?? '';
+            if (typeof delta === 'string' && delta.length > 0) {
+              onToken(delta);
+            }
+          } else if (json.type === 'message_stop') {
+            done = true;
+            break;
+          }
+        } catch {
+          // ignore malformed lines
+        }
+      }
+    }
+  } finally {
+    onDone && onDone();
+  }
+}
+
+/**
+ * Stream from OpenAI-compatible API
+ */
+async function streamOpenAI(opts: StreamOpts): Promise<void> {
+  const { system, user, onToken, onDone } = opts;
+
   const controller = new AbortController();
   const base = env.OPENAI_BASE_URL?.replace(/\/$/, '') || 'https://api.openai.com/v1';
   const url = `${base}/chat/completions`;
@@ -30,7 +140,7 @@ export async function streamAnswer(opts: StreamOpts): Promise<void> {
     ],
     stream: true,
     max_tokens: opts.maxTokens ?? env.MAX_TOKENS ?? 1024,
-    temperature: opts.temperature ?? 0.3,  // Lowered for more deterministic, grounded responses
+    temperature: opts.temperature ?? 0.3,
   };
 
   const headers: Record<string, string> = {
@@ -114,5 +224,3 @@ async function safeText(res: Response): Promise<string> {
     return '';
   }
 }
-
-
