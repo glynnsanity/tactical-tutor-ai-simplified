@@ -23,8 +23,104 @@ import { analyzeIntent, type IntentAnalysis } from '../services/intentAnalyzer';
 import { getCachedIntent, cacheIntent } from '../services/intentCache';
 import { getCachedResponse, cacheResponse } from '../services/responseCache';
 import { loadProfile } from '../profile/store';
+import { getProgress, isAnalyzing } from '../analysis/sessionManager';
 import { promises as fs } from 'fs';
 import * as path from 'path';
+
+/**
+ * Analysis confidence levels based on games analyzed
+ */
+interface AnalysisConfidence {
+  level: 'limited' | 'partial' | 'good' | 'full';
+  gamesAnalyzed: number;
+  totalGames: number | null;
+  percentComplete: number;
+  isAnalyzing: boolean;
+  message: string;
+}
+
+/**
+ * Determine confidence level based on analysis progress
+ */
+function getAnalysisConfidence(userId: string, summariesCount: number): AnalysisConfidence {
+  const progress = getProgress(userId);
+  const analyzing = isAnalyzing(userId);
+
+  if (progress && analyzing) {
+    // Analysis in progress
+    const percent = progress.percentComplete;
+    let level: AnalysisConfidence['level'];
+    let message: string;
+
+    if (percent < 20) {
+      level = 'limited';
+      message = `I'm still analyzing your games (${percent}% complete). My answers will improve as I process more data.`;
+    } else if (percent < 50) {
+      level = 'partial';
+      message = `Analysis ${percent}% complete. I have enough data for general insights, but patterns may still emerge.`;
+    } else if (percent < 90) {
+      level = 'good';
+      message = `Analysis ${percent}% complete. I have solid data to work with.`;
+    } else {
+      level = 'full';
+      message = `Analysis nearly complete (${percent}%).`;
+    }
+
+    return {
+      level,
+      gamesAnalyzed: progress.gamesAnalyzed,
+      totalGames: progress.totalGames,
+      percentComplete: percent,
+      isAnalyzing: true,
+      message,
+    };
+  }
+
+  // No active analysis - use summaries count
+  let level: AnalysisConfidence['level'];
+  let message: string;
+
+  if (summariesCount < 20) {
+    level = 'limited';
+    message = `I only have ${summariesCount} games to analyze. More games would help me give better advice.`;
+  } else if (summariesCount < 100) {
+    level = 'partial';
+    message = `Based on ${summariesCount} games analyzed.`;
+  } else if (summariesCount < 300) {
+    level = 'good';
+    message = `Based on ${summariesCount} games - solid sample size.`;
+  } else {
+    level = 'full';
+    message = `Based on comprehensive analysis of ${summariesCount} games.`;
+  }
+
+  return {
+    level,
+    gamesAnalyzed: summariesCount,
+    totalGames: null,
+    percentComplete: 100,
+    isAnalyzing: false,
+    message,
+  };
+}
+
+/**
+ * Format confidence indicator for display
+ */
+function formatConfidenceIndicator(confidence: AnalysisConfidence): string {
+  const icons: Record<AnalysisConfidence['level'], string> = {
+    limited: '[Limited Data]',
+    partial: '[Partial Analysis]',
+    good: '[Good Coverage]',
+    full: '[Full Analysis]',
+  };
+
+  if (confidence.isAnalyzing) {
+    return `${icons[confidence.level]} ${confidence.gamesAnalyzed}/${confidence.totalGames} games analyzed`;
+  }
+
+  return icons[confidence.level];
+}
 
 const AskBody = z.object({
   question: z.string().min(1).max(2000),
@@ -266,6 +362,18 @@ export default async function askRoutes(app: FastifyInstance) {
           }
 
           app.log.info(`[Ask] Found ${summaries.length} games for analysis`);
+
+          // Check analysis confidence level
+          const confidence = getAnalysisConfidence(userId, summaries.length);
+          app.log.info(`[Ask] Confidence: ${confidence.level} (${confidence.gamesAnalyzed} games, analyzing: ${confidence.isAnalyzing})`);
+
+          // If analysis is in progress with very limited data, inform user
+          if (confidence.isAnalyzing && confidence.level === 'limited') {
+            appendTokens(jobId, [
+              `*${formatConfidenceIndicator(confidence)}*\n\n`,
+              `${confidence.message}\n\n`,
+            ]);
+          }
 
           // STAGE 0: Check for complex analysis requests that need scope prompting
           const complexRequest = detectComplexAnalysisRequest(userQuestion);
@@ -695,6 +803,11 @@ export default async function askRoutes(app: FastifyInstance) {
           // Add game link if available
           if (content.games.length > 0 && content.games[0].chesscomUrl) {
             appendTokens(jobId, [`\n[View game on Chess.com](${content.games[0].chesscomUrl})`]);
+          }
+
+          // Add confidence indicator if analysis is in progress or limited
+          if (confidence.isAnalyzing || confidence.level === 'limited' || confidence.level === 'partial') {
+            appendTokens(jobId, [`\n\n---\n*${formatConfidenceIndicator(confidence)}* - ${confidence.message}`]);
           }
 
           markDone(jobId);

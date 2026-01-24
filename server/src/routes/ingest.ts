@@ -9,7 +9,8 @@ const Query = z.object({
   userId: z.string().min(1),
   limitMonths: z.coerce.number().int().min(1).max(120).default(12), // Default to 1 year
   limitGames: z.coerce.number().int().min(1).max(1000).default(100), // Default to last 100 games
-  quickStart: z.coerce.boolean().optional().default(false), // Enable progressive analysis
+  // Note: z.coerce.boolean() treats "false" string as true! Must use transform.
+  quickStart: z.string().optional().default('false').transform(v => v === 'true'),
   quickStartGames: z.coerce.number().int().min(5).max(50).optional().default(10), // Quick start game count
 });
 
@@ -68,24 +69,51 @@ export default async function ingestRoutes(app: FastifyInstance) {
       }
       
       // Regular mode: Analyze all games before responding
-      let added = 0;
-      const summaries: any[] = [];
-      
-      archiveLoop2: for (const url of archives) {
+      // Step 1: Collect all PGNs first (fast)
+      const allPgns: string[] = [];
+      for (const url of archives) {
+        if (allPgns.length >= limitGames) break;
         const raw = await fetchArchive(url);
         const games = raw.split(/\n\n(?=\[Event )/).filter(Boolean);
         for (const pgn of games) {
-          if (summaries.length >= limitGames) {
-            break archiveLoop2;
-          }
-          
-          const sum = await pgnToSummary(pgn, username);
-          if (sum) {
-            summaries.push(sum);
-            added++;
-          }
+          if (allPgns.length >= limitGames) break;
+          allPgns.push(pgn);
         }
       }
+
+      app.log.info(`[Ingest] Collected ${allPgns.length} PGNs, starting parallel analysis...`);
+
+      // Step 2: Process games in parallel batches
+      const BATCH_SIZE = 8; // Process 8 games concurrently
+      const summaries: any[] = [];
+      const startTime = Date.now();
+      let processed = 0;
+
+      for (let i = 0; i < allPgns.length; i += BATCH_SIZE) {
+        const batch = allPgns.slice(i, i + BATCH_SIZE);
+
+        // Process batch in parallel
+        const batchResults = await Promise.all(
+          batch.map(pgn => pgnToSummary(pgn, username))
+        );
+
+        // Collect valid summaries
+        for (const sum of batchResults) {
+          if (sum) {
+            summaries.push(sum);
+          }
+        }
+
+        processed += batch.length;
+
+        // Log progress every batch
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        const avgPerGame = (parseFloat(elapsed) / processed).toFixed(2);
+        const gamesPerMin = (processed / (parseFloat(elapsed) / 60)).toFixed(1);
+        app.log.info(`[Ingest] Progress: ${processed}/${allPgns.length} games (${elapsed}s, ${avgPerGame}s/game, ${gamesPerMin} games/min)`);
+      }
+
+      const added = summaries.length;
       
       if (summaries.length > 0) await upsertSummaries(userId, summaries);
       const total = (await loadSummaries(userId)).length;
@@ -99,6 +127,7 @@ export default async function ingestRoutes(app: FastifyInstance) {
 
 /**
  * Continue analysis in background after quick start
+ * Uses parallel processing for better throughput
  */
 async function continueAnalysisInBackground(
   app: FastifyInstance,
@@ -108,47 +137,56 @@ async function continueAnalysisInBackground(
   totalGames: number,
   alreadyProcessed: number
 ): Promise<void> {
-  app.log.info(`[Background] Starting analysis for ${username}, target: ${totalGames} games`);
-  
-  const summaries: any[] = [];
-  let gamesProcessed = 0;
-  
-  archiveLoop: for (const url of archives) {
+  const remainingGames = totalGames - alreadyProcessed;
+  app.log.info(`[Background] Starting parallel analysis for ${username}, target: ${remainingGames} more games`);
+
+  // Collect remaining PGNs
+  const allPgns: string[] = [];
+  let skipped = 0;
+
+  for (const url of archives) {
+    if (allPgns.length >= remainingGames) break;
     const raw = await fetchArchive(url);
     const games = raw.split(/\n\n(?=\[Event )/).filter(Boolean);
-    
+
     for (const pgn of games) {
-      gamesProcessed++;
-      
-      // Skip games already processed in quick start
-      if (gamesProcessed <= alreadyProcessed) {
+      // Skip already processed games
+      if (skipped < alreadyProcessed) {
+        skipped++;
         continue;
       }
-      
-      // Stop if we've reached the total game limit
-      if (summaries.length >= (totalGames - alreadyProcessed)) {
-        break archiveLoop;
-      }
-      
-      const sum = await pgnToSummary(pgn, username);
-      if (sum) {
-        summaries.push(sum);
-        
-        // Save in batches of 10 to provide progressive updates
-        if (summaries.length % 10 === 0) {
-          await upsertSummaries(userId, summaries);
-          app.log.info(`[Background] Saved ${summaries.length} more games for ${username}`);
-          summaries.length = 0; // Clear batch
-        }
-      }
+      if (allPgns.length >= remainingGames) break;
+      allPgns.push(pgn);
     }
   }
-  
-  // Save any remaining games
-  if (summaries.length > 0) {
-    await upsertSummaries(userId, summaries);
+
+  app.log.info(`[Background] Collected ${allPgns.length} PGNs for parallel processing`);
+
+  // Process in parallel batches
+  const BATCH_SIZE = 8;
+  const startTime = Date.now();
+  let processed = 0;
+  let totalSaved = 0;
+
+  for (let i = 0; i < allPgns.length; i += BATCH_SIZE) {
+    const batch = allPgns.slice(i, i + BATCH_SIZE);
+
+    const batchResults = await Promise.all(
+      batch.map(pgn => pgnToSummary(pgn, username))
+    );
+
+    const validSummaries = batchResults.filter(Boolean);
+    if (validSummaries.length > 0) {
+      await upsertSummaries(userId, validSummaries as any[]);
+      totalSaved += validSummaries.length;
+    }
+
+    processed += batch.length;
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    const avgPerGame = (parseFloat(elapsed) / processed).toFixed(2);
+    app.log.info(`[Background] Progress: ${processed}/${allPgns.length} games (${elapsed}s, ${avgPerGame}s/game)`);
   }
-  
+
   const total = (await loadSummaries(userId)).length;
   app.log.info(`[Background] Analysis complete for ${username}. Total games: ${total}`);
 }

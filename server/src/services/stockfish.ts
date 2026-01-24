@@ -21,6 +21,55 @@ interface EngineOutput {
   bestMove?: string;
 }
 
+// Track if Stockfish is available
+let stockfishAvailable: boolean | null = null;
+
+/**
+ * Check if Stockfish binary exists
+ */
+async function checkStockfishAvailable(): Promise<boolean> {
+  if (stockfishAvailable !== null) {
+    return stockfishAvailable;
+  }
+
+  const stockfishPath = process.env.STOCKFISH_PATH || 'stockfish';
+
+  return new Promise((resolve) => {
+    try {
+      const testProcess = spawn(stockfishPath, [], {
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+
+      const timeout = setTimeout(() => {
+        testProcess.kill();
+        stockfishAvailable = false;
+        resolve(false);
+      }, 3000);
+
+      testProcess.on('error', () => {
+        clearTimeout(timeout);
+        stockfishAvailable = false;
+        console.log('[Stockfish] Binary not found - Stockfish analysis disabled');
+        resolve(false);
+      });
+
+      testProcess.stdout?.once('data', () => {
+        clearTimeout(timeout);
+        testProcess.stdin?.write('quit\n');
+        testProcess.kill();
+        stockfishAvailable = true;
+        console.log('[Stockfish] Binary found - Stockfish analysis enabled');
+        resolve(true);
+      });
+
+      testProcess.stdin?.write('uci\n');
+    } catch {
+      stockfishAvailable = false;
+      resolve(false);
+    }
+  });
+}
+
 /**
  * Stockfish Engine Pool
  * Manages multiple Stockfish instances for parallel analysis
@@ -29,48 +78,82 @@ class StockfishPool {
   private engines: ChildProcess[] = [];
   private available: ChildProcess[] = [];
   private readonly poolSize: number;
+  private initialized: boolean = false;
+  private initFailed: boolean = false;
 
   constructor(poolSize: number = 2) {
     this.poolSize = poolSize;
   }
 
   async initialize(): Promise<void> {
-    for (let i = 0; i < this.poolSize; i++) {
-      const engine = await this.createEngine();
-      this.engines.push(engine);
-      this.available.push(engine);
+    // Check if Stockfish is available first
+    const isAvailable = await checkStockfishAvailable();
+    if (!isAvailable) {
+      this.initFailed = true;
+      console.log('[StockfishPool] Stockfish not available, pool disabled');
+      return;
+    }
+
+    try {
+      for (let i = 0; i < this.poolSize; i++) {
+        const engine = await this.createEngine();
+        if (engine) {
+          this.engines.push(engine);
+          this.available.push(engine);
+        }
+      }
+      this.initialized = this.engines.length > 0;
+      if (!this.initialized) {
+        this.initFailed = true;
+      }
+    } catch (err) {
+      console.error('[StockfishPool] Failed to initialize:', err);
+      this.initFailed = true;
     }
   }
 
-  private async createEngine(): Promise<ChildProcess> {
+  isAvailable(): boolean {
+    return this.initialized && !this.initFailed && this.engines.length > 0;
+  }
+
+  private async createEngine(): Promise<ChildProcess | null> {
     // Use system-installed Stockfish binary
     // On macOS with Homebrew: /opt/homebrew/bin/stockfish
     // On Linux: usually /usr/bin/stockfish or /usr/games/stockfish
     const stockfishPath = process.env.STOCKFISH_PATH || 'stockfish';
-    
-    const engine = spawn(stockfishPath, [], {
-      stdio: ['pipe', 'pipe', 'pipe']
+
+    return new Promise((resolve) => {
+      try {
+        const engine = spawn(stockfishPath, [], {
+          stdio: ['pipe', 'pipe', 'pipe']
+        });
+
+        // Handle spawn errors
+        engine.on('error', (err) => {
+          console.error('[Stockfish] Engine spawn error:', err.message);
+          resolve(null);
+        });
+
+        const timeout = setTimeout(() => {
+          engine.kill();
+          resolve(null);
+        }, 5000);
+
+        const onData = (data: Buffer) => {
+          if (data.toString().includes('uciok')) {
+            clearTimeout(timeout);
+            engine.stdout?.removeListener('data', onData);
+            resolve(engine);
+          }
+        };
+
+        engine.stdout?.on('data', onData);
+        engine.stdin?.write('uci\n');
+      } catch (err) {
+        console.error('[Stockfish] Failed to spawn engine:', err);
+        resolve(null);
+      }
     });
-
-    // Wait for engine to be ready
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error('Stockfish initialization timeout'));
-      }, 5000);
-
-      const onData = (data: Buffer) => {
-        if (data.toString().includes('uciok')) {
-          clearTimeout(timeout);
-          engine.stdout?.removeListener('data', onData);
-          resolve();
-        }
-      };
-      
-      engine.stdout?.on('data', onData);
-      engine.stdin?.write('uci\n');
-    });
-
-    return engine;
   }
 
   async acquire(): Promise<ChildProcess> {
@@ -96,28 +179,55 @@ class StockfishPool {
 
 // Global engine pool (lazy initialized)
 let enginePool: StockfishPool | null = null;
+let poolInitPromise: Promise<StockfishPool> | null = null;
 
 async function getEnginePool(): Promise<StockfishPool> {
   if (!enginePool) {
-    enginePool = new StockfishPool(8); // 8 engines for parallel analysis
-    await enginePool.initialize();
+    if (!poolInitPromise) {
+      poolInitPromise = (async () => {
+        // 32 engines to support heavy parallel game processing
+        // Each game can request 40+ concurrent analyses, so we need a large pool
+        // Can be tuned via STOCKFISH_POOL_SIZE env var
+        const poolSize = parseInt(process.env.STOCKFISH_POOL_SIZE || '32', 10);
+        const pool = new StockfishPool(poolSize);
+        await pool.initialize();
+        console.log(`[StockfishPool] Initialized with ${poolSize} engines`);
+        enginePool = pool;
+        return pool;
+      })();
+    }
+    return poolInitPromise;
   }
   return enginePool;
 }
 
 /**
+ * Check if Stockfish analysis is available
+ */
+export async function isStockfishAvailable(): Promise<boolean> {
+  const pool = await getEnginePool();
+  return pool.isAvailable();
+}
+
+/**
  * Analyze a position with Stockfish
+ * Throws an error if Stockfish is not available
  */
 export async function analyzeWithStockfish(
   fen: string,
   depth: number = 15
 ): Promise<Evaluation> {
   const pool = await getEnginePool();
+
+  if (!pool.isAvailable()) {
+    throw new Error('Stockfish is not available');
+  }
+
   const engine = await pool.acquire();
 
   try {
     const result = await analyzePosition(engine, fen, depth);
-    
+
     return {
       fen,
       eval: result.mate ? result.mate * 10000 : result.score,

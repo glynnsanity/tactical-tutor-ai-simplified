@@ -6,6 +6,7 @@ import pollRoutes from './routes/poll';
 import ingestRoutes from './routes/ingest';
 import ingestLocalRoutes from './routes/ingestLocal';
 import insightsRoutes from './routes/insights';
+import analyzeStreamRoutes from './routes/analyzeStream';
 import { env } from './services/env';
 
 const PORT = env.PORT;
@@ -26,6 +27,7 @@ async function buildServer() {
   await app.register(ingestRoutes);
   await app.register(ingestLocalRoutes);
   await app.register(insightsRoutes);
+  await app.register(analyzeStreamRoutes);
 
   try {
     await app.listen({ port: PORT, host: '0.0.0.0' });
