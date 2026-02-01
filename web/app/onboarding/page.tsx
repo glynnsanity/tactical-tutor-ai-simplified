@@ -44,8 +44,9 @@ export default function OnboardingPage() {
     setProgress('Fetching your games from Chess.com...')
 
     try {
-      // Generate a userId
-      const userId = `user-${Date.now()}`
+      // Use username as stable userId for persistence across sessions
+      const normalizedUsername = username.trim().toLowerCase()
+      const userId = `chesscom-${normalizedUsername}`
 
       setProgress('Analyzing your recent games...')
       const result = await ingestChessCom(username.trim(), userId, {
